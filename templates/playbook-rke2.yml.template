@@ -1,0 +1,366 @@
+---
+# Install RKE2 (Rancher Kubernetes Engine 2).
+# Follows https://docs.rke2.io/install/quickstart using the dataplane IPs
+# so cluster traffic stays on the FABRIC L2 network.
+#
+# FABRIC-specific: management NICs are often IPv6-only and own the default
+# route. Canal/Flannel picks that iface when flannel.iface is unset, leaving
+# nodes NotReady. We pin Flannel/Calico to the dataplane via can-reach.
+# FABRIC-specific networking preparation.
+#
+# Calico pods use 169.254.1.1 as their virtual default gateway and rely on
+# proxy ARP on the host-side cali* interface. Some FABRIC sites (for example
+# NEWY) have no host route covering 169.254.1.1, which prevents Linux from
+# answering the proxy-ARP request.
+#
+# FABRIC does provide a route to its metadata address 169.254.169.254.
+# Use that route to discover the management gateway/interface and install
+# a /32 route for Calico's virtual gateway only when one does not already exist.
+
+- name: Prepare FABRIC host networking for RKE2
+  hosts: all
+  become: true
+  tasks:
+
+    - name: Check whether Calico virtual gateway is already routable
+      ansible.builtin.command:
+        cmd: ip route get 169.254.1.1
+      register: calico_gateway_route
+      changed_when: false
+      failed_when: false
+
+    - name: Discover FABRIC management route
+      ansible.builtin.command:
+        cmd: ip route get 169.254.169.254
+      register: fabric_metadata_route
+      changed_when: false
+      when: calico_gateway_route.rc != 0
+
+    - name: Add route required for Calico proxy ARP
+      ansible.builtin.shell: |
+        set -euo pipefail
+
+        ROUTE="{{ fabric_metadata_route.stdout_lines[0] }}"
+
+        GATEWAY=$(echo "$ROUTE" | awk '{
+          for (i=1; i<=NF; i++)
+            if ($i == "via") {
+              print $(i+1)
+              exit
+            }
+        }')
+
+        DEVICE=$(echo "$ROUTE" | awk '{
+          for (i=1; i<=NF; i++)
+            if ($i == "dev") {
+              print $(i+1)
+              exit
+            }
+        }')
+
+        test -n "$GATEWAY"
+        test -n "$DEVICE"
+
+        ip route replace 169.254.1.1/32 via "$GATEWAY" dev "$DEVICE"
+      args:
+        executable: /bin/bash
+      when: calico_gateway_route.rc != 0
+
+    - name: Verify Calico virtual gateway route
+      ansible.builtin.command:
+        cmd: ip route get 169.254.1.1
+      register: calico_gateway_route_final
+      changed_when: false
+
+    - name: Show Calico virtual gateway route
+      ansible.builtin.debug:
+        var: calico_gateway_route_final.stdout_lines
+
+- name: Bootstrap RKE2 server (control plane)
+  hosts: rke2_servers
+  become: true
+  tasks:
+    - name: Ensure RKE2 config directory exists
+      ansible.builtin.file:
+        path: /etc/rancher/rke2
+        state: directory
+        mode: "0755"
+
+    - name: Discover dataplane interface for private IP
+      ansible.builtin.shell: |
+        ip -o -4 addr show | awk '$4 ~ /^{{ private_ip }}\// {print $2; exit}'
+      register: dataplane_iface
+      changed_when: false
+      failed_when: dataplane_iface.stdout | length == 0
+
+    - name: Show dataplane interface
+      ansible.builtin.debug:
+        msg: "Using dataplane iface {{ dataplane_iface.stdout }} for {{ private_ip }}"
+
+    - name: Write RKE2 server config (advertise on private dataplane IP)
+      ansible.builtin.copy:
+        dest: /etc/rancher/rke2/config.yaml
+        mode: "0600"
+        content: |
+          token: "{{ rke2_token }}"
+          node-ip: "{{ private_ip }}"
+          advertise-address: "{{ private_ip }}"
+          tls-san:
+            - "{{ private_ip }}"
+            - "{{ inventory_hostname }}"
+            - "127.0.0.1"
+
+    - name: Install RKE2 server
+      ansible.builtin.shell: curl -sfL https://get.rke2.io | sh -
+      args:
+        creates: /usr/local/bin/rke2
+        executable: /bin/bash
+
+    - name: Ensure server manifests directory exists
+      ansible.builtin.file:
+        path: /var/lib/rancher/rke2/server/manifests
+        state: directory
+        mode: "0755"
+
+    # Must exist BEFORE first rke2-server start so Canal installs correctly.
+    - name: Write Canal HelmChartConfig for FABRIC dataplane
+      ansible.builtin.copy:
+        dest: /var/lib/rancher/rke2/server/manifests/rke2-canal-config.yaml
+        mode: "0600"
+        content: |
+          apiVersion: helm.cattle.io/v1
+          kind: HelmChartConfig
+          metadata:
+            name: rke2-canal
+            namespace: kube-system
+          spec:
+            valuesContent: |-
+              flannel:
+                # Do not set iface by name: FABRIC NICs can differ per node.
+                # iface-can-reach makes each node pick the L2 dataplane NIC.
+                args:
+                  - "--ip-masq"
+                  - "--kube-subnet-mgr"
+                  - "--iptables-forward-rules=false"
+                  - "--ip-blackhole-route"
+                  - "--iface-can-reach=__DATAPLANE_GATEWAY__"
+              calico:
+                ipAutoDetectionMethod: "can-reach=__DATAPLANE_GATEWAY__"
+
+    - name: Enable and start rke2-server
+      ansible.builtin.systemd:
+        name: rke2-server
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Wait for node-token file
+      ansible.builtin.wait_for:
+        path: /var/lib/rancher/rke2/server/node-token
+        timeout: 300
+
+    - name: Wait for Kubernetes API to become ready
+      ansible.builtin.command: >
+        /var/lib/rancher/rke2/bin/kubectl
+        --kubeconfig /etc/rancher/rke2/rke2.yaml
+        get nodes
+      register: api_ready
+      retries: 30
+      delay: 10
+      until: api_ready.rc == 0
+      changed_when: false
+
+    - name: Symlink kubectl onto PATH
+      ansible.builtin.file:
+        src: /var/lib/rancher/rke2/bin/kubectl
+        dest: /usr/local/bin/kubectl
+        state: link
+
+    - name: Create kubeconfig directory for the ubuntu user
+      ansible.builtin.file:
+        path: "/home/{{ ansible_user }}/.kube"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0755"
+
+    - name: Install kubeconfig for the ubuntu user
+      ansible.builtin.copy:
+        src: /etc/rancher/rke2/rke2.yaml
+        dest: "/home/{{ ansible_user }}/.kube/config"
+        remote_src: true
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0600"
+
+    - name: Publish join info for agent play
+      ansible.builtin.add_host:
+        name: rke2_bootstrap
+        server_url: "https://{{ private_ip }}:9345"
+        cluster_token: "{{ rke2_token }}"
+        dataplane_iface: "{{ dataplane_iface.stdout }}"
+
+
+- name: Join RKE2 agent (worker) nodes
+  hosts: rke2_agents
+  become: true
+  tasks:
+    - name: Ensure RKE2 config directory exists
+      ansible.builtin.file:
+        path: /etc/rancher/rke2
+        state: directory
+        mode: "0755"
+
+    - name: Write RKE2 agent config
+      ansible.builtin.copy:
+        dest: /etc/rancher/rke2/config.yaml
+        mode: "0600"
+        content: |
+          server: "{{ hostvars['rke2_bootstrap']['server_url'] }}"
+          token: "{{ hostvars['rke2_bootstrap']['cluster_token'] }}"
+          node-ip: "{{ private_ip }}"
+
+    - name: Install RKE2 agent
+      ansible.builtin.shell: curl -sfL https://get.rke2.io | INSTALL_RKE2_TYPE="agent" sh -
+      args:
+        creates: /usr/local/bin/rke2
+        executable: /bin/bash
+      environment:
+        INSTALL_RKE2_TYPE: agent
+
+    - name: Enable and start rke2-agent
+      ansible.builtin.systemd:
+        name: rke2-agent
+        enabled: true
+        state: started
+        daemon_reload: true
+
+
+- name: Verify RKE2 cluster
+  hosts: rke2_servers
+  become: true
+  tasks:
+    - name: Wait for rke2-canal DaemonSet
+      ansible.builtin.command: >
+        /var/lib/rancher/rke2/bin/kubectl
+        --kubeconfig /etc/rancher/rke2/rke2.yaml
+        -n kube-system
+        get daemonset rke2-canal
+      register: canal_ds
+      retries: 18
+      delay: 5
+      until: canal_ds.rc == 0
+      changed_when: false
+      
+    - name: Force Canal API access over FABRIC dataplane
+      ansible.builtin.command: >
+        /var/lib/rancher/rke2/bin/kubectl
+        --kubeconfig /etc/rancher/rke2/rke2.yaml
+        -n kube-system
+        set env daemonset/rke2-canal
+        KUBERNETES_SERVICE_HOST={{ rke2_server_private_ip }}
+        KUBERNETES_SERVICE_PORT=6443
+      register: canal_api_env
+      changed_when: "'updated' in canal_api_env.stdout"
+      
+    - name: Wait until both nodes are Ready
+      ansible.builtin.shell: |
+        count=$(/var/lib/rancher/rke2/bin/kubectl --kubeconfig /etc/rancher/rke2/rke2.yaml get nodes --no-headers 2>/dev/null | grep -c ' Ready' || true)
+        echo "${count:-0}"
+      register: ready_nodes
+      retries: 36
+      delay: 10
+      until: (ready_nodes.stdout | trim | int) >= (groups['rke2_servers'] | length + groups['rke2_agents'] | length)
+      changed_when: false
+
+    - name: Show cluster nodes
+      ansible.builtin.command: >
+        /var/lib/rancher/rke2/bin/kubectl
+        --kubeconfig /etc/rancher/rke2/rke2.yaml
+        get nodes -o wide
+      register: nodes_out
+      changed_when: false
+
+    - name: Print node list
+      ansible.builtin.debug:
+        var: nodes_out.stdout_lines
+
+    - name: Show system pods
+      ansible.builtin.command: >
+        /var/lib/rancher/rke2/bin/kubectl
+        --kubeconfig /etc/rancher/rke2/rke2.yaml
+        get pods -n kube-system -o wide
+      register: sys_pods
+      changed_when: false
+
+    - name: Print system pods
+      ansible.builtin.debug:
+        var: sys_pods.stdout_lines
+
+    - name: Deploy demo nginx Deployment + Service
+      ansible.builtin.shell: |
+        /var/lib/rancher/rke2/bin/kubectl --kubeconfig /etc/rancher/rke2/rke2.yaml apply -f - <<'EOF'
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: nginx-demo
+        spec:
+          replicas: 2
+          selector:
+            matchLabels:
+              app: nginx-demo
+          template:
+            metadata:
+              labels:
+                app: nginx-demo
+            spec:
+              containers:
+                - name: nginx
+                  image: nginx:alpine
+                  ports:
+                    - containerPort: 80
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: nginx-demo
+        spec:
+          type: NodePort
+          selector:
+            app: nginx-demo
+          ports:
+            - port: 80
+              targetPort: 80
+              nodePort: 30080
+        EOF
+      args:
+        executable: /bin/bash
+      register: demo_apply
+      changed_when: "'created' in demo_apply.stdout or 'configured' in demo_apply.stdout"
+
+    - name: Wait for nginx-demo pods to be Ready
+      ansible.builtin.command: >
+        /var/lib/rancher/rke2/bin/kubectl
+        --kubeconfig /etc/rancher/rke2/rke2.yaml
+        rollout status deployment/nginx-demo --timeout=180s
+      changed_when: false
+
+    - name: Show demo pods and service
+      ansible.builtin.shell: |
+        /var/lib/rancher/rke2/bin/kubectl --kubeconfig /etc/rancher/rke2/rke2.yaml get pods,svc -l app=nginx-demo -o wide
+      register: demo_out
+      changed_when: false
+
+    - name: Print demo workload status
+      ansible.builtin.debug:
+        var: demo_out.stdout_lines
+
+    - name: Show expected 200 returned value for curl
+      ansible.builtin.shell: |
+        curl -s -o /dev/null -w '%{http_code}\n' http://__RKE2_SERVER_PRIVATE_IP__:30080/
+      register: curl_out
+      changed_when: false
+
+    - name: Print curl status
+      ansible.builtin.debug:
+        var: curl_out.stdout_lines

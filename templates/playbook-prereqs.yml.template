@@ -1,0 +1,75 @@
+---
+# Prepare Ubuntu nodes for RKE2 (Rancher Kubernetes Engine 2).
+# Declarative version of the RKE2 OS / networking prerequisites.
+
+- name: Prepare hosts for RKE2
+  hosts: all
+  become: true
+  tasks:
+    - name: Install prerequisite packages
+      ansible.builtin.apt:
+        name:
+          - curl
+          - ca-certificates
+          - open-iscsi
+          - nfs-common
+          - iptables
+          - apparmor
+          - apparmor-utils
+        state: present
+        update_cache: true
+
+    - name: Disable swap (required by Kubernetes)
+      ansible.builtin.command: swapoff -a
+      changed_when: false
+
+    - name: Ensure swap stays disabled across reboots
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^([^#].*\s+swap\s+.*)$'
+        replace: '# \1'
+
+    - name: Load overlay kernel module
+      ansible.builtin.command: modprobe overlay
+      changed_when: false
+      failed_when: false
+
+    - name: Load br_netfilter kernel module
+      ansible.builtin.command: modprobe br_netfilter
+      changed_when: false
+      failed_when: false
+
+    - name: Persist kernel module loads
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/rke2.conf
+        mode: "0644"
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Configure sysctl for Kubernetes networking
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/90-rke2.conf
+        mode: "0644"
+        content: |
+          net.bridge.bridge-nf-call-iptables = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward = 1
+          net.ipv6.conf.all.forwarding = 1
+
+    - name: Apply sysctl settings
+      ansible.builtin.command: sysctl --system
+      changed_when: false
+
+    - name: Set unique hostname from inventory name
+      ansible.builtin.hostname:
+        name: "{{ inventory_hostname }}"
+
+    - name: Build /etc/hosts entries for cluster nodes
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: ".*\\s{{ item }}$"
+        line: "{{ hostvars[item].private_ip }} {{ item }}"
+        state: present
+      loop: "{{ groups['rke2_servers'] + groups['rke2_agents'] }}"
+      when: hostvars[item].private_ip is defined
